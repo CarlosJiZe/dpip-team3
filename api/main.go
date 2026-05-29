@@ -4,12 +4,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-// Usuarios hardcodeados: username -> password
+// ---- Usuarios hardcodeados ----
 var users = map[string]string{
 	"Carlos": "carlos123",
 	"Demian": "demian123",
@@ -17,17 +20,43 @@ var users = map[string]string{
 	"Loco":   "loco123",
 }
 
-// Tokens activos en memoria: token -> username
-var activeTokens = map[string]string{}
+// ---- Estructuras ----
+type Workload struct {
+	WorkloadID     string   `json:"workload_id"`
+	Filter         string   `json:"filter"`
+	WorkloadName   string   `json:"workload_name"`
+	Status         string   `json:"status"`
+	RunningJobs    int      `json:"running_jobs"`
+	FilteredImages []string `json:"filtered_images"`
+}
 
-// generateToken genera un token aleatorio
-func generateToken() string {
+type Image struct {
+	ImageID    string `json:"image_id"`
+	WorkloadID string `json:"workload_id"`
+	Type       string `json:"type"`
+}
+
+// ---- Almacenamiento en memoria ----
+var activeTokens = map[string]string{}
+var workloads = map[string]*Workload{}
+var images = map[string]*Image{}
+
+// ---- Helpers ----
+func generateID() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
 }
 
-// authMiddleware verifica que el request tenga un token válido
+func getActiveWorkloadNames() []string {
+	names := []string{}
+	for _, w := range workloads {
+		names = append(names, w.WorkloadName)
+	}
+	return names
+}
+
+// ---- Auth middleware ----
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -36,7 +65,6 @@ func authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 		username, exists := activeTokens[token]
 		if !exists {
@@ -44,20 +72,22 @@ func authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-
-		// Guardamos el username en el contexto para usarlo después
 		c.Set("username", username)
 		c.Next()
 	}
 }
 
+// ---- Main ----
 func main() {
+	// Crear directorio para guardar imágenes
+	os.MkdirAll("storage", os.ModePerm)
+
 	router := gin.Default()
 
-	// Endpoints públicos (sin token)
+	// Endpoint público
 	router.POST("/login", loginHandler)
 
-	// Endpoints protegidos (requieren token)
+	// Endpoints protegidos
 	protected := router.Group("/")
 	protected.Use(authMiddleware())
 	{
@@ -72,54 +102,137 @@ func main() {
 	router.Run(":8080")
 }
 
-// POST /login — Basic Auth
+// ---- Handlers ----
+
+// POST /login
 func loginHandler(c *gin.Context) {
 	username, password, ok := c.Request.BasicAuth()
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "basic auth required"})
 		return
 	}
-
 	expectedPassword, exists := users[username]
 	if !exists || expectedPassword != password {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
-
-	token := generateToken()
+	token := generateID()
 	activeTokens[token] = username
-
-	c.JSON(http.StatusOK, gin.H{
-		"user":  username,
-		"token": token,
-	})
+	c.JSON(http.StatusOK, gin.H{"user": username, "token": token})
 }
 
-// DELETE /logout — Bearer token
+// DELETE /logout
 func logoutHandler(c *gin.Context) {
 	token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 	delete(activeTokens, token)
 	c.JSON(http.StatusOK, gin.H{"logout_message": "logged out successfully"})
 }
 
+// GET /status
 func statusHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "status - not implemented yet"})
+	c.JSON(http.StatusOK, gin.H{
+		"system_name":      "DPIP Team 3",
+		"server_time":      time.Now().Format(time.RFC3339),
+		"active_workloads": getActiveWorkloadNames(),
+	})
 }
 
+// POST /workloads
 func createWorkloadHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "create workload - not implemented yet"})
+	var body struct {
+		Filter       string `json:"filter"`
+		WorkloadName string `json:"workload_name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if body.Filter != "grayscale" && body.Filter != "blur" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "filter must be grayscale or blur"})
+		return
+	}
+	if body.WorkloadName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workload_name is required"})
+		return
+	}
+
+	// Crear directorio para las imágenes del workload
+	os.MkdirAll(filepath.Join("storage", body.WorkloadName), os.ModePerm)
+
+	workload := &Workload{
+		WorkloadID:     generateID(),
+		Filter:         body.Filter,
+		WorkloadName:   body.WorkloadName,
+		Status:         "scheduling",
+		RunningJobs:    0,
+		FilteredImages: []string{},
+	}
+	workloads[workload.WorkloadID] = workload
+	c.JSON(http.StatusOK, workload)
 }
 
+// GET /workloads/:workload_id
 func getWorkloadHandler(c *gin.Context) {
 	workloadID := c.Param("workload_id")
-	c.JSON(http.StatusOK, gin.H{"message": "get workload - not implemented yet", "workload_id": workloadID})
+	workload, exists := workloads[workloadID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
+		return
+	}
+	c.JSON(http.StatusOK, workload)
 }
 
+// POST /images
 func uploadImageHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "upload image - not implemented yet"})
+	file, err := c.FormFile("data")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image file is required"})
+		return
+	}
+	workloadID := c.PostForm("workload_id")
+	imageType := c.PostForm("type")
+
+	if workloadID == "" || imageType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workload_id and type are required"})
+		return
+	}
+	workload, exists := workloads[workloadID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
+		return
+	}
+
+	imageID := generateID()
+	savePath := filepath.Join("storage", workload.WorkloadName, imageID+".png")
+
+	if err := c.SaveUploadedFile(file, savePath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save image"})
+		return
+	}
+
+	image := &Image{
+		ImageID:    imageID,
+		WorkloadID: workloadID,
+		Type:       imageType,
+	}
+	images[imageID] = image
+
+	c.JSON(http.StatusOK, image)
 }
 
+// GET /images/:image_id
 func downloadImageHandler(c *gin.Context) {
 	imageID := c.Param("image_id")
-	c.JSON(http.StatusOK, gin.H{"message": "download image - not implemented yet", "image_id": imageID})
+	image, exists := images[imageID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "image not found"})
+		return
+	}
+	workload, exists := workloads[image.WorkloadID]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
+		return
+	}
+	imagePath := filepath.Join("storage", workload.WorkloadName, imageID+".png")
+	c.File(imagePath)
 }
