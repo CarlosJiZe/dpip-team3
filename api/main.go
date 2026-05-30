@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +25,7 @@ var users = map[string]string{
 }
 
 // ---- Estructuras ----
+
 type Workload struct {
 	WorkloadID     string   `json:"workload_id"`
 	Filter         string   `json:"filter"`
@@ -28,24 +33,46 @@ type Workload struct {
 	Status         string   `json:"status"`
 	RunningJobs    int      `json:"running_jobs"`
 	FilteredImages []string `json:"filtered_images"`
+
+	// OriginalCount lleva la cuenta de originales subidos, para calcular
+	// progreso y estado. No se expone en el JSON.
+	OriginalCount int `json:"-"`
 }
 
 type Image struct {
 	ImageID    string `json:"image_id"`
 	WorkloadID string `json:"workload_id"`
 	Type       string `json:"type"`
+	// Seq es el indice del frame original (0, 1, 2, ...). Permite reconstruir
+	// el orden del video al final. Se propaga del original a su filtrada.
+	Seq int `json:"seq"`
 }
 
-// ---- Almacenamiento en memoria ----
-var activeTokens = map[string]string{}
-var workloads = map[string]*Workload{}
-var images = map[string]*Image{}
+// JobPayload es lo que la API manda al Controller para crear un job.
+type JobPayload struct {
+	JobID      string `json:"job_id"`
+	ImageID    string `json:"image_id"`
+	WorkloadID string `json:"workload_id"`
+	Filter     string `json:"filter"`
+	Token      string `json:"token"`
+	Seq        int    `json:"seq"`
+}
+
+// ---- Almacenamiento en memoria con mutex ----
+var (
+	activeTokens = map[string]string{}
+	workloads    = map[string]*Workload{}
+	images       = map[string]*Image{}
+	mu           sync.Mutex
+	jobQueue     = make(chan JobPayload, 20000)
+)
 
 // ---- Helpers ----
+
 func generateID() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func getActiveWorkloadNames() []string {
@@ -56,7 +83,44 @@ func getActiveWorkloadNames() []string {
 	return names
 }
 
+// updateWorkloadProgress recalcula running_jobs y status de un workload.
+// Debe llamarse con el mutex 'mu' ya tomado.
+func updateWorkloadProgress(w *Workload) {
+	filtered := len(w.FilteredImages)
+	w.RunningJobs = w.OriginalCount - filtered
+	if w.RunningJobs < 0 {
+		w.RunningJobs = 0
+	}
+	switch {
+	case w.OriginalCount == 0:
+		w.Status = "scheduling"
+	case filtered >= w.OriginalCount:
+		w.Status = "completed"
+	default:
+		w.Status = "running"
+	}
+}
+
+func notifyController(imageID, workloadID, filter, token string, seq int) {
+	jobQueue <- JobPayload{
+		JobID:      generateID(),
+		ImageID:    imageID,
+		WorkloadID: workloadID,
+		Filter:     filter,
+		Token:      token,
+		Seq:        seq,
+	}
+}
+
+func processJobQueue() {
+	for job := range jobQueue {
+		data, _ := json.Marshal(job)
+		http.Post("http://localhost:8081/jobs", "application/json", bytes.NewReader(data))
+	}
+}
+
 // ---- Auth middleware ----
+
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -66,7 +130,9 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 		token := strings.TrimPrefix(authHeader, "Bearer ")
+		mu.Lock()
 		username, exists := activeTokens[token]
+		mu.Unlock()
 		if !exists {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 			c.Abort()
@@ -78,16 +144,16 @@ func authMiddleware() gin.HandlerFunc {
 }
 
 // ---- Main ----
+
 func main() {
-	// Crear directorio para guardar imágenes
 	os.MkdirAll("storage", os.ModePerm)
+
+	go processJobQueue()
 
 	router := gin.Default()
 
-	// Endpoint público
 	router.POST("/login", loginHandler)
 
-	// Endpoints protegidos
 	protected := router.Group("/")
 	protected.Use(authMiddleware())
 	{
@@ -95,6 +161,7 @@ func main() {
 		protected.GET("/status", statusHandler)
 		protected.POST("/workloads", createWorkloadHandler)
 		protected.GET("/workloads/:workload_id", getWorkloadHandler)
+		protected.GET("/images", listImagesHandler)
 		protected.POST("/images", uploadImageHandler)
 		protected.GET("/images/:image_id", downloadImageHandler)
 	}
@@ -104,7 +171,6 @@ func main() {
 
 // ---- Handlers ----
 
-// POST /login
 func loginHandler(c *gin.Context) {
 	username, password, ok := c.Request.BasicAuth()
 	if !ok {
@@ -117,27 +183,31 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 	token := generateID()
+	mu.Lock()
 	activeTokens[token] = username
+	mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"user": username, "token": token})
 }
 
-// DELETE /logout
 func logoutHandler(c *gin.Context) {
 	token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+	mu.Lock()
 	delete(activeTokens, token)
+	mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"logout_message": "logged out successfully"})
 }
 
-// GET /status
 func statusHandler(c *gin.Context) {
+	mu.Lock()
+	names := getActiveWorkloadNames()
+	mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{
 		"system_name":      "DPIP Team 3",
 		"server_time":      time.Now().Format(time.RFC3339),
-		"active_workloads": getActiveWorkloadNames(),
+		"active_workloads": names,
 	})
 }
 
-// POST /workloads
 func createWorkloadHandler(c *gin.Context) {
 	var body struct {
 		Filter       string `json:"filter"`
@@ -156,7 +226,6 @@ func createWorkloadHandler(c *gin.Context) {
 		return
 	}
 
-	// Crear directorio para las imágenes del workload
 	os.MkdirAll(filepath.Join("storage", body.WorkloadName), os.ModePerm)
 
 	workload := &Workload{
@@ -166,15 +235,19 @@ func createWorkloadHandler(c *gin.Context) {
 		Status:         "scheduling",
 		RunningJobs:    0,
 		FilteredImages: []string{},
+		OriginalCount:  0,
 	}
+	mu.Lock()
 	workloads[workload.WorkloadID] = workload
+	mu.Unlock()
 	c.JSON(http.StatusOK, workload)
 }
 
-// GET /workloads/:workload_id
 func getWorkloadHandler(c *gin.Context) {
 	workloadID := c.Param("workload_id")
+	mu.Lock()
 	workload, exists := workloads[workloadID]
+	mu.Unlock()
 	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
 		return
@@ -182,7 +255,16 @@ func getWorkloadHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, workload)
 }
 
-// POST /images
+func listImagesHandler(c *gin.Context) {
+	mu.Lock()
+	imageList := []*Image{}
+	for _, img := range images {
+		imageList = append(imageList, img)
+	}
+	mu.Unlock()
+	c.JSON(http.StatusOK, imageList)
+}
+
 func uploadImageHandler(c *gin.Context) {
 	file, err := c.FormFile("data")
 	if err != nil {
@@ -196,7 +278,18 @@ func uploadImageHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "workload_id and type are required"})
 		return
 	}
+
+	// seq: indice del frame original. Opcional; si no viene se asume 0.
+	seq := 0
+	if seqStr := c.PostForm("seq"); seqStr != "" {
+		if v, errConv := strconv.Atoi(seqStr); errConv == nil {
+			seq = v
+		}
+	}
+
+	mu.Lock()
 	workload, exists := workloads[workloadID]
+	mu.Unlock()
 	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
 		return
@@ -214,21 +307,39 @@ func uploadImageHandler(c *gin.Context) {
 		ImageID:    imageID,
 		WorkloadID: workloadID,
 		Type:       imageType,
+		Seq:        seq,
 	}
+
+	mu.Lock()
 	images[imageID] = image
+	if imageType == "original" {
+		workload.OriginalCount++
+	} else if imageType == "filtered" {
+		workload.FilteredImages = append(workload.FilteredImages, imageID)
+	}
+	updateWorkloadProgress(workload)
+	mu.Unlock()
+
+	if imageType == "original" {
+		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		go notifyController(image.ImageID, workloadID, workload.Filter, token, seq)
+	}
 
 	c.JSON(http.StatusOK, image)
 }
 
-// GET /images/:image_id
 func downloadImageHandler(c *gin.Context) {
 	imageID := c.Param("image_id")
+	mu.Lock()
 	image, exists := images[imageID]
+	mu.Unlock()
 	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "image not found"})
 		return
 	}
+	mu.Lock()
 	workload, exists := workloads[image.WorkloadID]
+	mu.Unlock()
 	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
 		return

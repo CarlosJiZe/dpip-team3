@@ -1,4 +1,17 @@
 # Test images
 downloaded.png
 test.png
+filtered.png
+
+# Datos generados
 storage/
+frames/
+filtered-frames/
+
+# Videos
+*.mp4
+*.avi
+
+# Python / macOS
+__pycache__/
+.DS_Store

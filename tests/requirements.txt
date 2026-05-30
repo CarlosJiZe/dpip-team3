@@ -1,0 +1,7 @@
+certifi
+chardet
+idna
+numpy
+opencv-python
+requests
+urllib3

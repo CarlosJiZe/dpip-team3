@@ -12,7 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.nanomsg.org/mangos/v3/protocol/pub"
 	"go.nanomsg.org/mangos/v3/protocol/pull"
-
 	_ "go.nanomsg.org/mangos/v3/transport/all"
 )
 
@@ -34,6 +33,8 @@ type Job struct {
 	WorkloadID string `json:"workload_id"`
 	Filter     string `json:"filter"`
 	Status     string `json:"status"`
+	Token      string `json:"token"`
+	Seq        int    `json:"seq"` // indice del frame original
 }
 
 type Message struct {
@@ -111,7 +112,7 @@ func handleWorkerMessages(pullSock interface{ Recv() ([]byte, error) }) {
 			workers[worker.Name] = &worker
 			log.Printf("[REGISTER] Worker '%s' at %s tags=%v", worker.Name, worker.Address, worker.Tags)
 
-			// Mandar info de la API al worker recién registrado
+			// Mandar info de la API al worker recien registrado
 			apiInfo, _ := json.Marshal(map[string]string{
 				"type":     "api_info",
 				"endpoint": "http://localhost:8080",
@@ -149,7 +150,7 @@ func startHTTPServer(port int) {
 		c.JSON(http.StatusOK, workerList)
 	})
 
-	// POST /jobs — la API envía un nuevo job para procesar
+	// POST /jobs — la API envia un nuevo job para procesar
 	router.POST("/jobs", func(c *gin.Context) {
 		var job Job
 		if err := c.ShouldBindJSON(&job); err != nil {
@@ -160,8 +161,19 @@ func startHTTPServer(port int) {
 		mu.Lock()
 		jobs[job.JobID] = &job
 		mu.Unlock()
-		log.Printf("[JOB] New job received: %s filter=%s", job.JobID, job.Filter)
+		log.Printf("[JOB] New job received: %s filter=%s seq=%d", job.JobID, job.Filter, job.Seq)
 		c.JSON(http.StatusOK, job)
+	})
+
+	// GET /jobs — lista todos los jobs
+	router.GET("/jobs", func(c *gin.Context) {
+		mu.Lock()
+		defer mu.Unlock()
+		jobList := []*Job{}
+		for _, j := range jobs {
+			jobList = append(jobList, j)
+		}
+		c.JSON(http.StatusOK, jobList)
 	})
 
 	// GET /jobs/:job_id — consulta el status de un job
@@ -174,6 +186,22 @@ func startHTTPServer(port int) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
 			return
 		}
+		c.JSON(http.StatusOK, job)
+	})
+
+	// PATCH /jobs/:job_id/status — actualiza el status de un job
+	router.PATCH("/jobs/:job_id/status", func(c *gin.Context) {
+		jobID := c.Param("job_id")
+		status := c.Query("status")
+		mu.Lock()
+		defer mu.Unlock()
+		job, exists := jobs[jobID]
+		if !exists {
+			c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+			return
+		}
+		job.Status = status
+		log.Printf("[JOB] Job %s status updated to %s", jobID, status)
 		c.JSON(http.StatusOK, job)
 	})
 

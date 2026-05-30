@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,18 @@ var (
 	runningJobs int
 	mu          sync.Mutex
 	pushSock    mangos.Socket
+
+	// MaxConnsPerHost pone un tope duro de conexiones simultaneas hacia la API,
+	// evitando el agotamiento de puertos efimeros.
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     50,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 30 * time.Second,
+	}
 )
 
 // ---- Tipos RPC ----
@@ -41,6 +54,7 @@ type JobArgs struct {
 	WorkloadID string `json:"workload_id"`
 	Filter     string `json:"filter"`
 	Token      string `json:"token"`
+	Seq        int    `json:"seq"`
 }
 
 type JobReply struct {
@@ -52,7 +66,7 @@ type JobReply struct {
 type WorkerService struct{}
 
 func (w *WorkerService) ProcessJob(args *JobArgs, reply *JobReply) error {
-	log.Printf("[JOB] Starting job=%s filter=%s image=%s", args.JobID, args.Filter, args.ImageID)
+	log.Printf("[JOB] Starting job=%s filter=%s seq=%d image=%s", args.JobID, args.Filter, args.Seq, args.ImageID)
 
 	mu.Lock()
 	runningJobs++
@@ -90,8 +104,8 @@ func (w *WorkerService) ProcessJob(args *JobArgs, reply *JobReply) error {
 		return nil
 	}
 
-	// 4. Subir imagen filtrada
-	if err := uploadFilteredImage(tmpOutput, args.WorkloadID, args.Token); err != nil {
+	// 4. Subir imagen filtrada, conservando la seq del frame original
+	if err := uploadFilteredImage(tmpOutput, args.WorkloadID, args.Token, args.Seq); err != nil {
 		reply.Success = false
 		reply.Message = "failed to upload: " + err.Error()
 		return nil
@@ -99,7 +113,7 @@ func (w *WorkerService) ProcessJob(args *JobArgs, reply *JobReply) error {
 
 	reply.Success = true
 	reply.Message = "job completed successfully"
-	log.Printf("[JOB] Completed job=%s", args.JobID)
+	log.Printf("[JOB] Completed job=%s seq=%d", args.JobID, args.Seq)
 	return nil
 }
 
@@ -109,7 +123,7 @@ func downloadImage(imageID, token string) ([]byte, error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -137,8 +151,8 @@ func applyFilter(inputPath, outputPath, filter string) error {
 	}
 }
 
-// uploadFilteredImage sube la imagen filtrada a la API
-func uploadFilteredImage(filePath, workloadID, token string) error {
+// uploadFilteredImage sube la imagen filtrada a la API, incluyendo la seq.
+func uploadFilteredImage(filePath, workloadID, token string, seq int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -151,17 +165,22 @@ func uploadFilteredImage(filePath, workloadID, token string) error {
 	io.Copy(part, file)
 	writer.WriteField("workload_id", workloadID)
 	writer.WriteField("type", "filtered")
+	writer.WriteField("seq", strconv.Itoa(seq))
 	writer.Close()
 
 	req, _ := http.NewRequest("POST", apiEndpoint+"/images", &buf)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	// Drenamos siempre el body antes de cerrar para reutilizar la conexion.
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
