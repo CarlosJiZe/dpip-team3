@@ -54,8 +54,8 @@ var (
 )
 
 func main() {
-	pullPort := flag.Int("pull-port", 5555, "Port to receive messages from workers")
-	pubPort := flag.Int("pub-port", 5556, "Port to broadcast messages to workers")
+	pullPort := flag.Int("pull-port", 7777, "Port to receive messages from workers")
+	pubPort := flag.Int("pub-port", 7778, "Port to broadcast messages to workers")
 	httpPort := flag.Int("http-port", 8081, "Port for internal HTTP API")
 	flag.Parse()
 

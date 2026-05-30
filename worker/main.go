@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,9 +86,9 @@ func (w *WorkerService) ProcessJob(args *JobArgs, reply *JobReply) error {
 		return nil
 	}
 
-	// 2. Guardar en archivo temporal
-	tmpInput := fmt.Sprintf("/tmp/%s_input.png", args.ImageID)
-	tmpOutput := fmt.Sprintf("/tmp/%s_output.png", args.ImageID)
+	// 2. Guardar en archivo temporal (cross-platform: %TEMP% en Windows, /tmp en Linux/Mac)
+	tmpInput := filepath.Join(os.TempDir(), args.ImageID+"_input.png")
+	tmpOutput := filepath.Join(os.TempDir(), args.ImageID+"_output.png")
 	defer os.Remove(tmpInput)
 	defer os.Remove(tmpOutput)
 
@@ -235,13 +236,31 @@ func sendStatusLoop() {
 }
 
 func main() {
-	controllerHost := flag.String("controller", "localhost:5555", "Controller host:port")
+	controllerHost := flag.String("controller", "localhost:7777", "Controller host:port (PULL port)")
+	pubPort := flag.String("pub-port", "", "Controller PUB port (default: PULL port + 1)")
 	name := flag.String("worker-name", "worker1", "Worker name")
 	tagsStr := flag.String("tags", "cpu", "Tags separated by commas")
 	flag.Parse()
 
 	workerName = *name
 	tags := strings.Split(*tagsStr, ",")
+
+	// Calcular la dirección del socket PUB del controller (PULL port + 1 por defecto)
+	var pubAddr string
+	if *pubPort != "" {
+		host := (*controllerHost)[:strings.LastIndex(*controllerHost, ":")]
+		pubAddr = host + ":" + *pubPort
+	} else {
+		// Extraer host y puerto del flag --controller, sumar 1 al puerto
+		lastColon := strings.LastIndex(*controllerHost, ":")
+		host := (*controllerHost)[:lastColon]
+		portStr := (*controllerHost)[lastColon+1:]
+		portNum := 7778 // fallback seguro
+		if p, err := strconv.Atoi(portStr); err == nil {
+			portNum = p + 1
+		}
+		pubAddr = fmt.Sprintf("%s:%d", host, portNum)
+	}
 
 	// ---- PUSH socket: enviar mensajes al controller ----
 	sock, err := push.NewSocket()
@@ -260,7 +279,6 @@ func main() {
 		log.Fatal("Error creating SUB socket:", err)
 	}
 	subSock.SetOption(mangos.OptionSubscribe, []byte(""))
-	pubAddr := strings.Replace(*controllerHost, "5555", "5556", 1)
 	if err := subSock.Dial("tcp://" + pubAddr); err != nil {
 		log.Fatal("Error connecting to PUB socket:", err)
 	}
